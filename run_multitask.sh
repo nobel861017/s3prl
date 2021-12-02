@@ -50,7 +50,7 @@ ckpt_path="/SpeechNet/s3prl/result/downstream/pretrained-downstream_finetune-hub
 # NCCL_ASYNC_ERROR_HANDLING=1 python3 $distributed run_downstream.py -m train -n pretrained-downstream_finetune-${upstream}-weighted-sum-of-layers_${simple_tasks}_batch-${batch}_gpus-${gpus} -u $upstream -d $simple_tasks -c downstream/multitask.yaml -s layer_results -f --init_ckpt /SpeechNet/checkpoints
 
 # all (weighted sum of layers) on only hard tasks + pretrained upstream from a previous experiment (simple)
-NCCL_ASYNC_ERROR_HANDLING=1 python3 $distributed run_downstream.py -m train -n pretrained-downstream_${simple_tasks}-${upstream}-weighted-sum-of-layers_${hard_tasks}_batch-${batch}_gpus-${gpus} -u $upstream -d $hard_tasks -c downstream/multitask.yaml -s layer_results --init_ckpt /SpeechNet/checkpoints --init_upstream_ckpt $ckpt_path
+python3 $distributed run_lightning_downstream.py -m train -n pretrained-downstream_${simple_tasks}-${upstream}-weighted-sum-of-layers_${hard_tasks}_batch-${batch}_gpus-${gpus} -u $upstream -d $hard_tasks -c downstream/multitask.yaml -s layer_results --init_ckpt /SpeechNet/checkpoints --init_upstream_ckpt $ckpt_path
 
 # ====== autoloss or pcgrad ===============================================================================
 

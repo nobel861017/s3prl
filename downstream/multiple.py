@@ -21,19 +21,25 @@ from pcgrad import PCGrad
 from schedulers import get_scheduler
 from upstream.interfaces import Featurizer
 from utility.helper import is_leader_process, get_model_state, show, defaultdict
+from s3prl.utility.lightning.callbacks import LitProgressBar, Saver
+
+import pytorch_lightning as pl
 
 SAMPLE_RATE = 16000
 
-
-class ModelEntry:
+class ModelEntry(pl.LightningModule):
     def __init__(self, model, name, trainable, interfaces):
         self.model = model
         self.name = name
         self.trainable = trainable
         self.interfaces = interfaces
 
+        if not self.trainable:
+            # Set requires_grad=False
+            self.freeze()
 
-class DataEntry:
+
+class DataEntry(pl.LightningModule):
     def __init__(self, dataloader):
         self.dataloader = dataloader
         self.epoch = -1
@@ -60,11 +66,12 @@ class DataEntry:
         return batch_id, current_batch
 
 
-class Runner():
+class Runner(pl.LightningModule):
     """
     Used to handle high-level concepts of a ML experiment
     eg. training loop, evaluation loop, upstream propagation, optimization, logging, checkpoint saving
     """
+    super().__init__()
     def __init__(self, args, config):
         self.args = args
         self.config = config
@@ -75,6 +82,14 @@ class Runner():
 
         self.downstreams = [self._get_downstream(d) for d in self.args.downstream.split(",")]
         self.all_models = [self.upstream, self.featurizer] + self.downstreams
+
+        # specaug
+        self.specaug = None
+        if self.config.get('specaug'):
+            from .specaug import SpecAug
+            self.specaug = SpecAug(**self.config["specaug"])
+        
+        self.data_entries = _construct_data_entries()
 
 
     def _load_ckpt(self):
@@ -148,7 +163,7 @@ class Runner():
         model = Upstream(
             ckpt = self.args.upstream_ckpt,
             model_config = self.args.upstream_model_config,
-            refresh = upstream_refresh,
+            refresh = upstream_refresh
         ).to(self.args.device)
 
         if is_initialized() and get_rank() == 0:
@@ -222,19 +237,16 @@ class Runner():
             self._load_weight(scheduler, 'Scheduler')
         return scheduler
 
-
-    def train(self):
+    def configure_optimizers(self):
         # trainable parameters and train/eval mode
         trainable_models = []
-        trainable_paras = []
         trainable_upstream_model = []
         trainable_other_models = []
         for entry in self.all_models:
             if entry.trainable:
                 entry.model.train()
                 trainable_models.append(entry.model)
-                trainable_paras += list(entry.model.parameters())
-                if entry.name == 'Upstream' or entry.name == 'Featurizer':
+            if entry.name == 'Upstream' or entry.name == 'Featurizer':
                     trainable_upstream_model.append(entry.model)
                 else:
                     trainable_other_models.append(entry.model)
@@ -242,14 +254,172 @@ class Runner():
                 entry.model.eval()
 
         # optimizer
-        upstream_optimizer = self._get_optimizer(trainable_upstream_model, 'UpstreamOptimizer')
-        other_optimizer = self._get_optimizer(trainable_other_models, 'OtherOptimizer')
+        #optimizer = self._get_optimizer(trainable_models)
+        #upstream_optimizer = self._get_optimizer(trainable_upstream_model, 'UpstreamOptimizer')
+        other_optimizer = self._get_optimizer(trainable_upstream_model+trainable_other_models, 'OtherOptimizer')
+        #if self.args.pcgrad:
+        #    upstream_optimizer = PCGrad(upstream_optimizer)
+        #    print('###########################')
+        #    print('Use PCGrad for Upstream!!!')
+        #    print('###########################')
+        
+        # scheduler
+        #upstream_scheduler = None
+        other_scheduler = None
+        if self.config.get('scheduler'):
+            #if hasattr(upstream_optimizer, '_optim'):
+            #    upstream_scheduler = self._get_scheduler(upstream_optimizer.optimizer, 'UpstreamScheduler')
+            #else:
+            #    upstream_scheduler = self._get_scheduler(upstream_optimizer, 'UpstreamScheduler')
+            other_scheduler = self._get_scheduler(other_optimizer, 'OtherScheduler')
+            return other_optimizer, other_scheduler
+        return upstream_optimizer
 
-        if self.args.pcgrad:
-            upstream_optimizer = PCGrad(upstream_optimizer)
-            print('###########################')
-            print('Use PCGrad for Upstream!!!')
-            print('###########################')
+    def configure_callbacks(self):
+        self.saver = Saver()
+        callbacks = [self.saver]
+        # callbacks.append(LitProgressBar())  # NOTE: optional
+        return callbacks
+
+
+    """def train_dataloader(self):
+        #self.train_dataloader = self.downstream.model.get_dataloader('train')
+        #return self.train_dataloader
+        data_entries = []
+        for expert in self.downstreams:
+            dataloader = expert.model.get_dataloader("train")
+            data_entry = DataEntry(dataloader)
+            init_epoch = self.init_ckpt.get(f"Epoch.{expert.name}")
+            if init_epoch:
+                data_entry.epoch = init_epoch
+            data_entries.append(data_entry)
+        return data_entries"""
+
+    def _construct_data_entries(self):
+        data_entries = []
+        for expert in self.downstreams:
+            dataloader = expert.model.get_dataloader("train")
+            data_entry = DataEntry(dataloader)
+            init_epoch = self.init_ckpt.get(f"Epoch.{expert.name}")
+            if init_epoch:
+                data_entry.epoch = init_epoch
+            data_entries.append(data_entry)
+        return data_entries
+    
+
+    def training_step(self):
+        loss = 0
+        all_task_batch_ids = []
+        all_task_wavs = []
+        all_task_others = []
+        all_task_lens = []
+        for expert, data in zip(self.downstreams, self.data_entries):
+            batch_id, (wavs, *others) = data.next_batch()
+            wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
+            all_task_batch_ids.append(batch_id)
+            all_task_wavs.append(wavs)
+            all_task_others.append(others)
+            all_task_lens.append(len(wavs))
+
+        # one forward pass of upstream, featurizer and specaug
+        if self.upstream.trainable:
+            features = self.upstream.model(all_task_wavs)
+        else:
+            with torch.no_grad():
+                features = self.upstream.model(all_task_wavs)
+
+        if specaug:
+            for i, task_features in enumerate(features):
+                features[i] = specaug(task_features)[0]
+        
+        # separate features into task-specific expert forwards
+        for expert, data, task_features, others, batch_id in \
+                zip(self.downstreams, self.data_entries, features, all_task_others, all_task_batch_ids):
+
+            task_loss = expert.model(
+                'train',
+                task_features, *others,
+                records = data.records,
+            )
+
+            loss += task_loss
+
+            data.batch_ids.append(batch_id)
+        
+        return {'loss': loss, 'records': data.records}
+    
+    def val_dataloader(self):
+        self.validation_dataloaders = [
+            self.downstream.model.get_dataloader(split)
+            for split in self.config['runner']['eval_dataloaders']
+        ]
+        return self.validation_dataloaders
+
+    def validation_step(self, batch, batch_idx, dataloader_idx):
+        wavs, *others = batch
+
+        features = self.upstream.model(wavs)
+        features = self.featurizer.model(wavs, features)
+        if self.specaug:
+            features, _ = self.specaug(features)
+
+        split = self.config['runner']['eval_dataloaders'][dataloader_idx]
+        records = defaultdict(list)
+        self.downstream.model(
+            split,
+            features, *others,
+            records = records,
+            batch_id = batch_idx,
+        )
+
+        return {'records': records}
+
+    def validation_epoch_end(self, outputs):
+        self.saver.validation_epoch_end(self.trainer, self)
+
+
+    def on_save_checkpoint(self, checkpoint):
+        # The following are automatically saved in checkpoint by lightning:
+        # - 16-bit scaling factor (apex)
+        # - Current epoch, global step
+        # - Model state_dict, optimizer states, scheduler states, callback states
+        # - Hyperparameters passed to the model (Argparse.Namespace)
+        checkpoint.update({
+            'Args': self.args,
+            'Config': self.config,
+        })
+
+    def on_load_checkpoint(self, checkpoint):
+        self.args = checkpoint['Args']
+        self.config = checkpoint['Config']
+
+    def train(self):
+        # trainable parameters and train/eval mode
+        #trainable_models = []
+        trainable_paras = []
+        #trainable_upstream_model = []
+        #trainable_other_models = []
+        for entry in self.all_models:
+            if entry.trainable:
+                #entry.model.train()
+                #trainable_models.append(entry.model)
+                trainable_paras += list(entry.model.parameters())
+                #if entry.name == 'Upstream' or entry.name == 'Featurizer':
+                #    trainable_upstream_model.append(entry.model)
+                #else:
+                #    trainable_other_models.append(entry.model)
+            #else:
+            #    entry.model.eval()
+
+        # optimizer
+        #upstream_optimizer = self._get_optimizer(trainable_upstream_model, 'UpstreamOptimizer')
+        #other_optimizer = self._get_optimizer(trainable_other_models, 'OtherOptimizer')
+
+        #if self.args.pcgrad:
+        #    upstream_optimizer = PCGrad(upstream_optimizer)
+        #    print('###########################')
+        #    print('Use PCGrad for Upstream!!!')
+        #    print('###########################')
 
         # scheduler
         upstream_scheduler = None
@@ -279,17 +449,17 @@ class Runner():
             logger = SummaryWriter(self.args.expdir)
 
         # prepare data
-        data_entries = []
+        """data_entries = []
         for expert in self.downstreams:
             dataloader = expert.model.get_dataloader("train")
             data_entry = DataEntry(dataloader)
             init_epoch = self.init_ckpt.get(f"Epoch.{expert.name}")
             if init_epoch:
                 data_entry.epoch = init_epoch
-            data_entries.append(data_entry)
+            data_entries.append(data_entry)"""
 
         backward_steps = 0
-        while pbar.n < pbar.total:
+        while pbar.n < pbar.total: # this is the iteration of steps
             loss = 0
 
             if self.args.pcgrad:
@@ -298,26 +468,30 @@ class Runner():
                 has_grad_list = []
 
             # append data of all tasks into a list for the upstream model forward pass
-            all_task_batch_ids = []
-            all_task_wavs = []
-            all_task_others = []
-            all_task_lens = []
-            for expert, data in zip(self.downstreams, data_entries):
-                batch_id, (wavs, *others) = data.next_batch()
-                wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
-                all_task_batch_ids.append(batch_id)
-                all_task_wavs.append(wavs)
-                all_task_others.append(others)
-                all_task_lens.append(len(wavs))
+            # all_task_batch_ids = []
+            # all_task_wavs = []
+            # all_task_others = []
+            # all_task_lens = []
+            # for expert, data in zip(self.downstreams, data_entries):
+            #    batch_id, (wavs, *others) = data.next_batch()
+            #    wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
+            #    all_task_batch_ids.append(batch_id)
+            #    all_task_wavs.append(wavs)
+            #    all_task_others.append(others)
+            #    all_task_lens.append(len(wavs))
 
             # one forward pass of upstream, featurizer and specaug
-            if self.upstream.trainable:
-                features = self.upstream.model(all_task_wavs)
-            else:
-                with torch.no_grad():
-                    features = self.upstream.model(all_task_wavs)
+            #if self.upstream.trainable:
+            #    features = self.upstream.model(all_task_wavs)
+            #else:
+            #    with torch.no_grad():
+            #        features = self.upstream.model(all_task_wavs)
+            with torch.set_grad_enabled(self.upstream.trainable):
+                features = self.upstream.model(wavs)
 
-            features = self.featurizer.model(all_task_wavs, features)
+            #features = self.featurizer.model(all_task_wavs, features)
+            features = self.featurizer.model(wavs, features)
+
             if specaug:
                 for i, task_features in enumerate(features):
                     features[i] = specaug(task_features)[0]
@@ -477,11 +651,11 @@ class Runner():
                 print('Finished saving!!!')
                 print('##################')
 
-            pbar.update(1)
+            #3pbar.update(1)
 
-        pbar.close()
-        if is_leader_process():
-            logger.close()
+        #pbar.close()
+        #if is_leader_process():
+        #    logger.close()
 
     
     def evaluate(self):
